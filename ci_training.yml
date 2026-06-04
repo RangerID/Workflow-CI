@@ -1,0 +1,319 @@
+name: CI – MLflow Training & Docker Build
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "MLProject/**"
+      - ".github/workflows/ci_training.yml"
+      - "Dockerfile"
+
+  pull_request:
+    branches: [main, master]
+
+  schedule:
+    - cron: "0 1 * * 1"
+
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model yang dilatih"
+        required: true
+        default: "RandomForest"
+        type: choice
+        options:
+          - RandomForest
+          - LogisticRegression
+          - SVM
+      n_estimators:
+        description: "Jumlah pohon (RandomForest)"
+        required: false
+        default: "100"
+      max_depth:
+        description: "max_depth pohon; 0 = unlimited"
+        required: false
+        default: "0"
+      C:
+        description: "Regularisasi C (LogReg / SVM)"
+        required: false
+        default: "1.0"
+      push_docker:
+        description: "Push Docker image ke Docker Hub?"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+# ── Env global ────────────────────────────────────────────────────────────────
+env:
+  PYTHON_VERSION:    "3.10"
+  MLFLOW_TRACKING_URI: sqlite:///mlflow.db
+  DOCKER_IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/plants-mlflow
+
+jobs:
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1 – TRAINING
+# ─────────────────────────────────────────────────────────────────────────────
+  train:
+    name: Train Model (MLflow Project)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: MLProject
+
+    outputs:
+      run_id:        ${{ steps.get_run_id.outputs.run_id }}
+      model_name:    ${{ steps.params.outputs.model }}
+      artifact_tag:  ${{ steps.params.outputs.artifact_tag }}
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Resolve parameters (dispatch vs push default) ───────────────────
+      - name: Resolve training parameters
+        id: params
+        run: |
+          MODEL="${{ github.event.inputs.model || 'RandomForest' }}"
+          N_EST="${{ github.event.inputs.n_estimators || '100' }}"
+          MAX_D="${{ github.event.inputs.max_depth || '0' }}"
+          C_VAL="${{ github.event.inputs.C || '1.0' }}"
+          TAG="${MODEL}-n${N_EST}-d${MAX_D}-$(date +'%Y%m%d-%H%M')"
+          echo "model=$MODEL"         >> $GITHUB_OUTPUT
+          echo "n_estimators=$N_EST"  >> $GITHUB_OUTPUT
+          echo "max_depth=$MAX_D"     >> $GITHUB_OUTPUT
+          echo "C=$C_VAL"             >> $GITHUB_OUTPUT
+          echo "artifact_tag=$TAG"    >> $GITHUB_OUTPUT
+          echo "--- Params ---"
+          echo "  model=$MODEL  n_est=$N_EST  max_depth=$MAX_D  C=$C_VAL"
+
+      # ── 3. Setup Python ────────────────────────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      # ── 4. Install dependencies ────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "mlflow>=2.12,<3.0" \
+            scikit-learn>=1.4 \
+            numpy>=1.24 \
+            pandas>=2.1 \
+            matplotlib>=3.8 \
+            Pillow>=10.0 \
+            seaborn>=0.13
+
+      # ── 5. Verify dataset ──────────────────────────────────────────────────
+      - name: Verify preprocessed dataset
+        run: |
+          echo "=== Dataset files ==="
+          ls -lh plants_preprocessing/
+          python - <<'EOF'
+          import numpy as np
+          for s in ['train', 'test', 'valid']:
+              X = np.load(f'plants_preprocessing/X_{s}.npy')
+              y = np.load(f'plants_preprocessing/y_{s}.npy')
+              print(f'  [{s}] X={X.shape} y={y.shape} dtype={X.dtype}')
+          EOF
+
+      # ── 6. Run MLflow Project ──────────────────────────────────────────────
+      - name: Run MLflow Project (training)
+        run: |
+          mlflow run . \
+            --env-manager local \
+            --entry-point main \
+            -P model="${{ steps.params.outputs.model }}" \
+            -P n_estimators="${{ steps.params.outputs.n_estimators }}" \
+            -P max_depth="${{ steps.params.outputs.max_depth }}" \
+            -P C="${{ steps.params.outputs.C }}" \
+            -P data_dir="plants_preprocessing"
+
+      # ── 7. Extract MLflow run ID ───────────────────────────────────────────
+      - name: Extract latest MLflow run ID
+        id: get_run_id
+        run: |
+          RUN_ID=$(python - <<'EOF'
+          import sqlite3, os
+          conn = sqlite3.connect("mlflow.db")
+          cur  = conn.execute(
+              "SELECT run_uuid FROM runs ORDER BY start_time DESC LIMIT 1"
+          )
+          print(cur.fetchone()[0])
+          conn.close()
+          EOF
+          )
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "MLflow Run ID: $RUN_ID"
+
+      # ── 8. Export artefak dari MLflow ke folder artifacts/ ────────────────
+      - name: Export MLflow artifacts
+        run: |
+          mkdir -p artifacts
+          python - <<'EOF'
+          import mlflow, shutil, os
+          mlflow.set_tracking_uri("sqlite:///mlflow.db")
+          client = mlflow.tracking.MlflowClient()
+          runs   = client.search_runs(
+              experiment_ids=[
+                  e.experiment_id
+                  for e in client.search_experiments()
+                  if "ci" in e.name
+              ]
+          )
+          if not runs:
+              print("No runs found")
+              exit(0)
+          run = sorted(runs, key=lambda r: r.info.start_time, reverse=True)[0]
+          print(f"Exporting artifacts from run: {run.info.run_id}")
+          arts_path = client.download_artifacts(run.info.run_id, "", dst_path="artifacts")
+          print(f"Artifacts saved to: {arts_path}")
+          # Write metrics summary
+          import json
+          with open("artifacts/metrics_summary.json", "w") as f:
+              json.dump(run.data.metrics, f, indent=2)
+          with open("artifacts/params_summary.json", "w") as f:
+              json.dump(run.data.params, f, indent=2)
+          EOF
+          echo "=== Exported artifacts ==="
+          find artifacts/ -type f
+
+      # ── 9. Upload artefak ke GitHub Actions ───────────────────────────────
+      - name: Upload training artifacts (GitHub Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-artifacts-${{ steps.params.outputs.artifact_tag }}
+          path: |
+            MLProject/artifacts/
+            MLProject/mlflow.db
+          retention-days: 30
+
+      # ── 10. Commit artefak ke branch 'artifacts' ──────────────────────────
+      - name: Commit artifacts to branch
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Buat/pindah ke branch artifacts tanpa history
+          git fetch origin artifacts 2>/dev/null || true
+          git checkout -B artifacts origin/artifacts 2>/dev/null || git checkout --orphan artifacts
+
+          # Salin artefak ke root
+          mkdir -p saved_artifacts/${{ steps.params.outputs.artifact_tag }}
+          cp -r artifacts/* saved_artifacts/${{ steps.params.outputs.artifact_tag }}/ 2>/dev/null || true
+
+          # Buat index.md
+          cat > saved_artifacts/index.md << EOF
+          # MLflow Training Artifacts
+
+          | Tag | Commit | Tanggal |
+          |-----|--------|---------|
+          | ${{ steps.params.outputs.artifact_tag }} | ${{ github.sha }} | $(date -u) |
+          EOF
+
+          git add saved_artifacts/
+          git diff --cached --quiet || \
+            git commit -m "ci: artifacts ${{ steps.params.outputs.artifact_tag }} [skip ci]"
+          git push origin artifacts --force-with-lease || git push origin artifacts
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 2 – DOCKER BUILD & PUSH
+# ─────────────────────────────────────────────────────────────────────────────
+  docker:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: train
+
+    # Hanya jalankan jika:
+    #   - bukan PR, DAN
+    #   - input push_docker != 'false' (atau event bukan dispatch)
+    if: |
+      github.event_name != 'pull_request' &&
+      github.event.inputs.push_docker != 'false'
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Setup Docker Buildx ─────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 3. Login ke Docker Hub ─────────────────────────────────────────────
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ── 4. Extract metadata (tags & labels) ───────────────────────────────
+      - name: Extract Docker metadata
+        id: docker_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ needs.train.outputs.model_name }}-${{ github.run_number }}
+            type=sha,prefix=sha-
+
+      # ── 5. Build & Push ────────────────────────────────────────────────────
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context:   .
+          file:      ./Dockerfile
+          push:      true
+          tags:      ${{ steps.docker_meta.outputs.tags }}
+          labels:    ${{ steps.docker_meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      # ── 6. Simpan info Docker ke artefak ──────────────────────────────────
+      - name: Save Docker image info
+        run: |
+          cat > docker_info.txt << EOF
+          Image   : ${{ env.DOCKER_IMAGE_NAME }}
+          Tags    : ${{ steps.docker_meta.outputs.tags }}
+          Run     : ${{ github.run_number }}
+          Commit  : ${{ github.sha }}
+          Built   : $(date -u)
+          Model   : ${{ needs.train.outputs.model_name }}
+          EOF
+          cat docker_info.txt
+
+      - name: Upload Docker info artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-info-${{ github.run_number }}
+          path: docker_info.txt
+          retention-days: 30
+
+      # ── 7. Tulis link Docker Hub ke job summary ───────────────────────────
+      - name: Write to Job Summary
+        run: |
+          echo "## Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.DOCKER_IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.docker_meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Pull command:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${{ env.DOCKER_IMAGE_NAME }}:latest" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

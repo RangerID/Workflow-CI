@@ -1,0 +1,61 @@
+name: plants-type-classification
+
+# Gunakan environment conda yang didefinisikan di conda.yaml
+conda_env: conda.yaml
+
+# ─── Entry Points ────────────────────────────────────────────────────────────
+entry_points:
+
+  # Entry point utama: training model
+  main:
+    parameters:
+      model:
+        type:    str
+        default: RandomForest
+        # Pilihan: RandomForest | LogisticRegression | SVM
+
+      n_estimators:
+        type:    int
+        default: 100
+        # Jumlah pohon (hanya berlaku untuk RandomForest)
+
+      max_depth:
+        type:    int
+        default: 0
+        # Kedalaman maksimum pohon; 0 berarti tidak dibatasi (RandomForest)
+
+      C:
+        type:    float
+        default: 1.0
+        # Kekuatan regularisasi (LogisticRegression / SVM)
+
+      data_dir:
+        type:    str
+        default: plants_preprocessing
+        # Path ke folder berisi file .npy hasil preprocessing
+
+    command: >
+      python modelling.py
+        --model        {model}
+        --n_estimators {n_estimators}
+        --max_depth    {max_depth}
+        --C            {C}
+        --data_dir     {data_dir}
+
+  # Entry point tambahan: training semua model sekaligus
+  train_all:
+    parameters:
+      data_dir:
+        type:    str
+        default: plants_preprocessing
+
+    command: >
+      python -c "
+      import subprocess, sys
+      models = ['RandomForest', 'LogisticRegression', 'SVM']
+      for m in models:
+          print(f'=== Training {m} ===')
+          subprocess.run([sys.executable, 'modelling.py',
+                          '--model', m,
+                          '--data_dir', '{data_dir}'], check=True)
+      "
